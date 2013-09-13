@@ -11,6 +11,7 @@ from StringIO import StringIO
 import gzip
 import tornado.httpclient
 import tornado.httputil
+from tornado import gen
 
 # Internal modules
 from tweepy.error import TweepError
@@ -126,6 +127,7 @@ def bind_api(**config):
                     return cache_result
             return None
 
+        @gen.coroutine
         def execute_async(self):
             # Build the request URL
             url = self.api_root + self.path
@@ -143,26 +145,25 @@ def bind_api(**config):
                     self.method, self.headers, self.parameters
                     )
             url = self.scheme + self.host + url
-            req = tornado.httpclient.HTTPRequest(url=url, headers=self.headers)
+            req = tornado.httpclient.HTTPRequest(url=url, headers=self.headers, method='GET')
             conn = tornado.httpclient.AsyncHTTPClient()
-            response = conn.fetch(req, callback=self._on_response)
-        
-        def _on_response(self, response):
-            # If an error was returned, throw an exception
-            self.api.last_response = response
-            if response.code != 200:
+
+            try:
+                response = yield conn.fetch(req)
+            except tornado.httpclient.HTTPError as err:
                 try:
-                    error_msg = self.api.parser.parse_error(response.body)
+                    error_msg = self.api.parser.parse_error(err.response.body)
                 except Exception:
-                    error_msg = "Twitter error response: status code = %s" % response.code
+                    error_msg = "Twitter error response: status code = %s" % err.code
                 raise TweepError(error_msg, response)
-
             # Parse the response payload
-            self.callback(self.api.parser.parse(self, response.body))
+            raise gen.Return(self.api.parser.parse(self, response.body))
 
+    @gen.coroutine
     def _call(api, *args, **kargs):
         method = APIMethod(api, args, kargs)
-        return method.execute_async()
+        result = yield method.execute_async()
+        raise gen.Return(result)
 
     # Set pagination mode
     if 'cursor' in APIMethod.allowed_param:
