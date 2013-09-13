@@ -46,7 +46,6 @@ def bind_api(**config):
             self.retry_delay = kargs.pop('retry_delay', api.retry_delay)
             self.retry_errors = kargs.pop('retry_errors', api.retry_errors)
             self.headers = kargs.pop('headers', {})
-            self.callback = kargs.pop('callback', None)
             self.build_parameters(args, kargs)
 
             # Pick correct URL root to use
@@ -136,7 +135,7 @@ def bind_api(**config):
 
             cache = self.get_cache(url)
             if cache:
-                self.callback(cache)
+                raise gen.Return(cache)
 
             # Apply authentication
             if self.api.auth:
