@@ -2,13 +2,17 @@
 # Copyright 2009-2010 Joshua Roesslein
 # See LICENSE for details.
 
+# External modules
 import httplib
 import urllib
 import time
 import re
 from StringIO import StringIO
 import gzip
+import tornado.httpclient
+import tornado.httputil
 
+# Internal modules
 from tweepy.error import TweepError
 from tweepy.utils import convert_to_utf8_str
 from tweepy.models import Model
@@ -41,6 +45,7 @@ def bind_api(**config):
             self.retry_delay = kargs.pop('retry_delay', api.retry_delay)
             self.retry_errors = kargs.pop('retry_errors', api.retry_errors)
             self.headers = kargs.pop('headers', {})
+            self.callback = kargs.pop('callback', None)
             self.build_parameters(args, kargs)
 
             # Pick correct URL root to use
@@ -102,16 +107,11 @@ def bind_api(**config):
                     del self.parameters[name]
 
                 self.path = self.path.replace(variable, value)
-
-        def execute(self):
-            # Build the request URL
-            url = self.api_root + self.path
-            if len(self.parameters):
-                url = '%s?%s' % (url, urllib.urlencode(self.parameters))
-
+        
+        def get_cache(self, url):
             # Query the cache if one is available
             # and this request uses a GET method.
-            if self.use_cache and self.api.cache and self.method == 'GET':
+            if self.api.cache and self.method == 'GET':
                 cache_result = self.api.cache.get(url)
                 # if cache result found and not expired, return it
                 if cache_result:
@@ -124,78 +124,45 @@ def bind_api(**config):
                         if isinstance(cache_result, Model):
                             cache_result._api = self.api
                     return cache_result
+            return None
 
-            # Continue attempting request until successful
-            # or maximum number of retries is reached.
-            retries_performed = 0
-            while retries_performed < self.retry_count + 1:
-                # Open connection
-                if self.api.secure:
-                    conn = httplib.HTTPSConnection(self.host, timeout=self.api.timeout)
-                else:
-                    conn = httplib.HTTPConnection(self.host, timeout=self.api.timeout)
+        def execute_async(self):
+            # Build the request URL
+            url = self.api_root + self.path
+            if len(self.parameters):
+                url = '%s?%s' % (url, urllib.urlencode(self.parameters))
 
-                # Apply authentication
-                if self.api.auth:
-                    self.api.auth.apply_auth(
-                            self.scheme + self.host + url,
-                            self.method, self.headers, self.parameters
+            cache = self.get_cache(url)
+            if cache:
+                self.callback(cache)
+
+            # Apply authentication
+            if self.api.auth:
+                self.api.auth.apply_auth(
+                    self.scheme + self.host + url,
+                    self.method, self.headers, self.parameters
                     )
-
-                # Request compression if configured
-                if self.api.compression:
-                    self.headers['Accept-encoding'] = 'gzip'
-
-                # Execute request
-                try:
-                    conn.request(self.method, url, headers=self.headers, body=self.post_data)
-                    resp = conn.getresponse()
-                except Exception, e:
-                    raise TweepError('Failed to send request: %s' % e)
-
-                # Exit request loop if non-retry error code
-                if self.retry_errors:
-                    if resp.status not in self.retry_errors: break
-                else:
-                    if resp.status == 200: break
-
-                # Sleep before retrying request again
-                time.sleep(self.retry_delay)
-                retries_performed += 1
-
+            url = self.scheme + self.host + url
+            req = tornado.httpclient.HTTPRequest(url=url, headers=self.headers)
+            conn = tornado.httpclient.AsyncHTTPClient()
+            response = conn.fetch(req, callback=self._on_response)
+        
+        def _on_response(self, response):
             # If an error was returned, throw an exception
-            self.api.last_response = resp
-            if resp.status and not 200 <= resp.status < 300:
+            self.api.last_response = response
+            if response.code != 200:
                 try:
-                    error_msg = self.api.parser.parse_error(resp.read())
+                    error_msg = self.api.parser.parse_error(response.body)
                 except Exception:
-                    error_msg = "Twitter error response: status code = %s" % resp.status
-                raise TweepError(error_msg, resp)
+                    error_msg = "Twitter error response: status code = %s" % response.code
+                raise TweepError(error_msg, response)
 
             # Parse the response payload
-            body = resp.read()
-            if resp.getheader('Content-Encoding', '') == 'gzip':
-                try:
-                    zipper = gzip.GzipFile(fileobj=StringIO(body))
-                    body = zipper.read()
-                except Exception, e:
-                    raise TweepError('Failed to decompress data: %s' % e)
-            result = self.api.parser.parse(self, body)
-
-            conn.close()
-
-            # Store result into cache if one is available.
-            if self.use_cache and self.api.cache and self.method == 'GET' and result:
-                self.api.cache.store(url, result)
-
-            return result
-
+            self.callback(self.api.parser.parse(self, response.body))
 
     def _call(api, *args, **kargs):
-
         method = APIMethod(api, args, kargs)
-        return method.execute()
-
+        return method.execute_async()
 
     # Set pagination mode
     if 'cursor' in APIMethod.allowed_param:
