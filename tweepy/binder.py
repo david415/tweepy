@@ -154,7 +154,7 @@ def bind_api(**config):
                     error_msg = self.api.parser.parse_error(err.response.body)
                 except Exception:
                     error_msg = "Twitter error response: status code = %s" % err.code
-                raise TweepError(error_msg, response)
+                raise TweepError(error_msg, err.response)
             # Parse the response payload
             raise gen.Return(self.api.parser.parse(self, response.body))
 
