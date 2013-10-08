@@ -3,7 +3,6 @@
 # See LICENSE for details.
 
 # External modules
-import httplib
 import urllib
 import time
 import re
@@ -108,11 +107,17 @@ def bind_api(**config):
 
                 self.path = self.path.replace(variable, value)
         
-        def get_cache(self, url):
+        @gen.coroutine
+        def execute_async(self):
+            # Build the request URL
+            uri = self.api_root + self.path
+            if len(self.parameters):
+                uri = '%s?%s' % (uri, urllib.urlencode(self.parameters))
+
             # Query the cache if one is available
             # and this request uses a GET method.
-            if self.api.cache and self.method == 'GET':
-                cache_result = self.api.cache.get(url)
+            if self.use_cache and self.api.cache and self.method == 'GET':
+                cache_result = self.api.cache.get(uri)
                 # if cache result found and not expired, return it
                 if cache_result:
                     # must restore api reference
@@ -123,40 +128,74 @@ def bind_api(**config):
                     else:
                         if isinstance(cache_result, Model):
                             cache_result._api = self.api
-                    return cache_result
-            return None
+                    raise gen.Return(cache_result)
 
-        @gen.coroutine
-        def execute_async(self):
-            # Build the request URL
-            url = self.api_root + self.path
-            if len(self.parameters):
-                url = '%s?%s' % (url, urllib.urlencode(self.parameters))
 
-            cache = self.get_cache(url)
-            if cache:
-                raise gen.Return(cache)
+            # Open connection
+            http_client = tornado.httpclient.AsyncHTTPClient()
 
-            # Apply authentication
-            if self.api.auth:
-                self.api.auth.apply_auth(
-                    self.scheme + self.host + url,
-                    self.method, self.headers, self.parameters
-                    )
-            url = self.scheme + self.host + url
-            req = tornado.httpclient.HTTPRequest(url=url, headers=self.headers, method='GET')
-            conn = tornado.httpclient.AsyncHTTPClient()
+            # Continue attempting request until successful
+            # or maximum number of retries is reached.
+            retries_performed = 0
+            response          = None
+            status            = None
+            while retries_performed < self.retry_count + 1:
 
-            try:
-                response = yield conn.fetch(req)
-            except tornado.httpclient.HTTPError as err:
+                # Apply authentication
+                if self.api.auth:
+                    self.api.auth.apply_auth(
+                        self.scheme + self.host + uri,
+                        self.method, self.headers, self.parameters
+                        )
+
+                # Request compression if configured
+                if self.api.compression:
+                    self.headers['Accept-encoding'] = 'gzip'
+
+                # Execute request
+                url = self.scheme + self.host + uri
+
                 try:
-                    error_msg = self.api.parser.parse_error(err.response.body)
+                    if self.post_data is not None:
+                        request = tornado.httpclient.HTTPRequest(url=url, headers=self.headers, method=self.method, body=self.post_data)
+                    else:
+                        request = tornado.httpclient.HTTPRequest(url=url, headers=self.headers, method=self.method, body='')
+
+                    response = yield http_client.fetch(request)
+                    status   = response.code
+                    break
+
+                except tornado.httpclient.HTTPError as err:
+                    response = err.response
+                    status   = err.code
+
+                    if status not in self.retry_errors:
+                        break
+
+                    # Sleep before retrying request again
+                    time.sleep(self.retry_delay)
+                    retries_performed += 1
+
+
+            self.api.last_response = response
+            if status and not 200 <= status < 300:
+                try:
+                    error_msg = self.api.parser.parse_error(response.body)
                 except Exception:
-                    error_msg = "Twitter error response: status code = %s" % err.code
-                raise TweepError(error_msg, err.response)
-            # Parse the response payload
-            raise gen.Return(self.api.parser.parse(self, response.body))
+                    error_msg = "Twitter error response: status code = %s" % status
+                raise TweepError(error_msg, response)
+
+
+            body = response.body
+            result = self.api.parser.parse(self, body)
+            http_client.close()
+
+            # Store result into cache if one is available.
+            if self.use_cache and self.api.cache and self.method == 'GET' and result:
+                self.api.cache.store(uri, result)
+
+            raise gen.Return(result)
+
 
     @gen.coroutine
     def _call(api, *args, **kargs):
