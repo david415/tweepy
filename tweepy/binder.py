@@ -159,6 +159,7 @@ def bind_api(**config):
                     if self.post_data is not None:
                         request = tornado.httpclient.HTTPRequest(url=url, headers=self.headers, method=self.method, body=self.post_data)
                     else:
+
                         request = tornado.httpclient.HTTPRequest(url=url, headers=self.headers, method=self.method, body='')
 
                     response = yield http_client.fetch(request)
@@ -169,8 +170,9 @@ def bind_api(**config):
                     response = err.response
                     status   = err.code
 
-                    if status not in self.retry_errors:
-                        break
+                    if self.retry_errors is not None:
+                        if status not in self.retry_errors:
+                            break
 
                     # Sleep before retrying request again
                     time.sleep(self.retry_delay)
@@ -185,10 +187,8 @@ def bind_api(**config):
                     error_msg = "Twitter error response: status code = %s" % status
                 raise TweepError(error_msg, response)
 
-
             body = response.body
             result = self.api.parser.parse(self, body)
-            http_client.close()
 
             # Store result into cache if one is available.
             if self.use_cache and self.api.cache and self.method == 'GET' and result:
